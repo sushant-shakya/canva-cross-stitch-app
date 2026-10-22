@@ -36,3 +36,128 @@
 .scrollContainer:focus-within::-webkit-scrollbar-thumb {
   visibility: visible;
 }
+
+/* Pattern preview card container with needlework/canvas checkered background */
+.previewBox {
+  position: relative;
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 180px;
+  max-height: 320px;
+  border-radius: 8px;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  padding: 12px;
+  background-color: #f7f7f8;
+  background-image:
+    linear-gradient(45deg, #ebebed 25%, transparent 25%),
+    linear-gradient(-45deg, #ebebed 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #ebebed 75%),
+    linear-gradient(-45deg, transparent 75%, #ebebed 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0px;
+}
+
+.previewSvg {
+  max-width: 100%;
+  max-height: 260px;
+  width: auto;
+  height: auto;
+  display: block;
+  filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.1));
+}
+
+/* Stats row */
+.statsRow {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.statBadge {
+  background: #f0f1f3;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 6px;
+  padding: 4px 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Thread palette chips */
+.paletteContainer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-top: 4px;
+}
+
+.paletteChip {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 2px solid #ffffff;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.2);
+  flex-shrink: 0;
+}
+
+/* Upload thumbnail box */
+.thumbnailContainer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  background: #f9f9fb;
+  border: 1px solid #e1e3e6;
+  border-radius: 8px;
+}
+
+.thumbnailImg {
+  width: 48px;
+  height: 48px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+}
+
+.thumbnailDetails {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Preset buttons grid */
+.presetGrid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+}
+
+/* File upload drop area */
+.fileInputArea {
+  position: relative;
+  border: 2px dashed #cfd3d8;
+  border-radius: 8px;
+  padding: 16px;
+  text-align: center;
+  background-color: #fafbfc;
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+}
+
+.fileInputArea:hover {
+  border-color: #7d2ae8;
+}
+
+.hiddenFileInput {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+}

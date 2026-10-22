@@ -1,9 +1,16 @@
 .DS_Store
 .env
+.env.local
+.env.*.local
+.canva
+.cache
 .idea
 .ssl
+*.pem
+*.key
 *.log*
 **/*/db.json
 dist
+build
 node_modules
 .swc
