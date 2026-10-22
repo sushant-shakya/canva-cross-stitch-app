@@ -2,6 +2,7 @@ import { useFeatureSupport } from "@canva/app-hooks";
 import { addElementAtCursor, addElementAtPoint } from "@canva/design";
 import type { Feature } from "@canva/platform";
 import { act, fireEvent, waitFor } from "@testing-library/react";
+import { quantizeCanvasToPattern } from "../../../utils/pattern_generator";
 import { renderInTestProvider } from "../../../utils/test_render";
 import { App } from "../app";
 
@@ -174,5 +175,177 @@ describe("Cross-Stitch & Pixel Pattern App Tests", () => {
     });
 
     expect(result.getByText("Text / Word")).toBeDefined();
+  });
+
+  it("should preserve thin calligraphy strokes with contrast boost and bridge 1-cell curve gaps", () => {
+    const gridSize = 20;
+    const ss = 8;
+    const sampleDim = gridSize * ss; // 160x160 sub-pixel buffer
+    const buffer = new Uint8ClampedArray(sampleDim * sampleDim * 4).fill(255);
+
+    const setSubPixel = (
+      cellRow: number,
+      cellCol: number,
+      subY: number,
+      subX: number,
+      rgb: number,
+    ) => {
+      const py = cellRow * ss + subY;
+      const px = cellCol * ss + subX;
+      const idx = (py * sampleDim + px) * 4;
+      buffer[idx] = rgb;
+      buffer[idx + 1] = rgb;
+      buffer[idx + 2] = rgb;
+      buffer[idx + 3] = 255;
+    };
+
+    // Simulate a thin script curve across cells (5, 5), (5, 6), grazed (6, 7), and (7, 8)
+    // where each active cell only has 3 dark/diluted sub-pixels out of 64 (far below the old 18/64 threshold)
+    setSubPixel(5, 5, 3, 3, 90);
+    setSubPixel(5, 5, 3, 4, 110);
+    setSubPixel(5, 5, 4, 4, 95);
+
+    setSubPixel(5, 6, 4, 2, 85);
+    setSubPixel(5, 6, 4, 3, 100);
+    setSubPixel(5, 6, 5, 3, 90);
+
+    // Cell (6, 7) has only 1 faint grazed sub-pixel (rgb = 232) bridging (5, 6) and (7, 8)
+    setSubPixel(6, 7, 4, 4, 232);
+
+    setSubPixel(7, 8, 2, 2, 80);
+    setSubPixel(7, 8, 2, 3, 95);
+    setSubPixel(7, 8, 3, 3, 85);
+
+    HTMLCanvasElement.prototype.getContext = jest
+      .fn()
+      .mockImplementation(() => ({
+        ...createMockContext(),
+        getImageData: jest.fn().mockReturnValue({
+          data: buffer,
+          width: sampleDim,
+          height: sampleDim,
+        }),
+      })) as unknown as typeof HTMLCanvasElement.prototype.getContext;
+
+    const canvas = document.createElement("canvas");
+    canvas.width = sampleDim;
+    canvas.height = sampleDim;
+
+    const quantized = quantizeCanvasToPattern(canvas, {
+      gridSize: 20,
+      stitchStyle: "cross_stitch",
+      ignoreBackground: true,
+      autoCrop: false,
+      colorCountLimit: 4,
+    });
+
+    const activeCoords = new Set(
+      quantized.cells.map((cell) => `${cell.row},${cell.col}`),
+    );
+
+    // Verify thin-stroke cells (with only 3/64 sub-pixels) were preserved and not averaged out to white
+    expect(activeCoords.has("5,5")).toBe(true);
+    expect(activeCoords.has("5,6")).toBe(true);
+    expect(activeCoords.has("7,8")).toBe(true);
+    // Verify the 1-cell curve gap at (6, 7) was bridged for continuous line preservation
+    expect(activeCoords.has("6,7")).toBe(true);
+  });
+
+  it("should preserve the complete cursive 'P' at 30x30 without broken hairlines or missing loops", () => {
+    const gridSize = 30;
+    const ss = 8;
+    const sampleDim = gridSize * ss; // 240x240 buffer
+    const buffer = new Uint8ClampedArray(sampleDim * sampleDim * 4).fill(255);
+
+    const markStrokeCell = (
+      row: number,
+      col: number,
+      subCount: number,
+      lum: number,
+    ) => {
+      for (let i = 0; i < subCount; i++) {
+        const sy = Math.floor(i / ss);
+        const sx = i % ss;
+        const py = row * ss + sy;
+        const px = col * ss + sx;
+        const idx = (py * sampleDim + px) * 4;
+        buffer[idx] = lum;
+        buffer[idx + 1] = lum;
+        buffer[idx + 2] = lum;
+        buffer[idx + 3] = 255;
+      }
+    };
+
+    // 1. Cursive "P" vertical stem: rows 5..24, col 10 (medium-weight stroke)
+    for (let r = 5; r <= 24; r++) {
+      markStrokeCell(r, 10, 22, 20);
+    }
+
+    // 2. Thin entry hairline sweep leading into top of "P": (10, 7) -> (8, 8) -> (6, 9)
+    // Only 2 dark pixels per cell (simulating a 1px calligraphy hairline)
+    markStrokeCell(10, 7, 2, 60);
+    markStrokeCell(9, 8, 2, 65);
+    markStrokeCell(7, 9, 2, 60);
+
+    // 3. Cursive "P" upper loop starting at (5, 11), curving out to col 17, and rejoining stem at (14, 11)
+    // Includes a single-cell diagonal break at (9, 17) where both sides are already attached to the stem!
+    const loopCells: [number, number][] = [
+      [5, 11],
+      [5, 12],
+      [5, 13],
+      [5, 14],
+      [6, 15],
+      [7, 16],
+      [8, 17],
+      // (9, 17) intentionally skipped to test closed-loop 8-way continuity bridging!
+      [10, 17],
+      [11, 16],
+      [12, 15],
+      [13, 14],
+      [14, 13],
+      [14, 12],
+      [14, 11],
+    ];
+    for (const [r, c] of loopCells) {
+      markStrokeCell(r, c, 2, 55);
+    }
+
+    HTMLCanvasElement.prototype.getContext = jest
+      .fn()
+      .mockImplementation(() => ({
+        ...createMockContext(),
+        getImageData: jest.fn().mockReturnValue({
+          data: buffer,
+          width: sampleDim,
+          height: sampleDim,
+        }),
+      })) as unknown as typeof HTMLCanvasElement.prototype.getContext;
+
+    const canvas = document.createElement("canvas");
+    canvas.width = sampleDim;
+    canvas.height = sampleDim;
+
+    const quantized = quantizeCanvasToPattern(canvas, {
+      gridSize: 30,
+      stitchStyle: "cross_stitch",
+      ignoreBackground: true,
+      autoCrop: false,
+      colorCountLimit: 4,
+    });
+
+    const activeCoords = new Set(
+      quantized.cells.map((cell) => `${cell.row},${cell.col}`),
+    );
+
+    // Verify hairline entry sweep is preserved
+    expect(activeCoords.has("10,7")).toBe(true);
+    expect(activeCoords.has("9,8")).toBe(true);
+    expect(activeCoords.has("7,9")).toBe(true);
+
+    // Verify the closed loop of the cursive "P" is preserved AND the 1-cell break at (9, 17) was bridged
+    expect(activeCoords.has("8,17")).toBe(true);
+    expect(activeCoords.has("9,17")).toBe(true);
+    expect(activeCoords.has("10,17")).toBe(true);
+    expect(quantized.initialPalette[0]?.currentHex).toBe("#000000");
   });
 });

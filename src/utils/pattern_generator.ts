@@ -408,8 +408,9 @@ export function quantizePixelsToPalette(
 }
 
 /**
- * Scans the source canvas to find the tight bounding box of non-background artwork
- * so empty margins don't waste grid resolution at small grid sizes (e.g. 20x20, 30x30).
+ * Scans the source canvas to find the tight non-white/non-transparent bounding box
+ * and crops tightly with a 5% padding so empty margins don't waste grid resolution
+ * at low grid sizes (e.g. 20x20, 30x30, 40x40).
  */
 function findForegroundBounds(
   sourceCanvas: HTMLCanvasElement,
@@ -423,7 +424,7 @@ function findForegroundBounds(
     return { x: 0, y: 0, w: srcW, h: srcH };
   }
 
-  const maxScanDim = 400;
+  const maxScanDim = 1024;
   const scale = Math.min(1, maxScanDim / Math.max(srcW, srcH));
   const scanW = Math.max(1, Math.round(srcW * scale));
   const scanH = Math.max(1, Math.round(srcH * scale));
@@ -445,6 +446,9 @@ function findForegroundBounds(
     return { x: 0, y: 0, w: srcW, h: srcH };
   }
 
+  // Use a slightly more inclusive threshold when scanning bounds so thin calligraphy swashes aren't clipped
+  const scanThreshold = Math.min(248, backgroundThreshold + 18);
+
   let minX = scanW;
   let minY = scanH;
   let maxX = -1;
@@ -458,9 +462,7 @@ function findForegroundBounds(
       const b = data[idx + 2] ?? 0;
       const a = data[idx + 3] ?? 0;
 
-      if (
-        !isBackgroundPixel(r, g, b, a, ignoreBackground, backgroundThreshold)
-      ) {
+      if (!isBackgroundPixel(r, g, b, a, ignoreBackground, scanThreshold)) {
         if (x < minX) minX = x;
         if (x > maxX) maxX = x;
         if (y < minY) minY = y;
@@ -475,10 +477,22 @@ function findForegroundBounds(
 
   const invScaleX = srcW / scanW;
   const invScaleY = srcH / scanH;
-  const cropX = Math.max(0, Math.floor(minX * invScaleX));
-  const cropY = Math.max(0, Math.floor(minY * invScaleY));
-  const cropRight = Math.min(srcW, Math.ceil((maxX + 1) * invScaleX));
-  const cropBottom = Math.min(srcH, Math.ceil((maxY + 1) * invScaleY));
+  const tightLeft = Math.max(0, Math.floor(minX * invScaleX));
+  const tightTop = Math.max(0, Math.floor(minY * invScaleY));
+  const tightRight = Math.min(srcW, Math.ceil((maxX + 1) * invScaleX));
+  const tightBottom = Math.min(srcH, Math.ceil((maxY + 1) * invScaleY));
+
+  const tightW = Math.max(1, tightRight - tightLeft);
+  const tightH = Math.max(1, tightBottom - tightTop);
+
+  // Add 5% padding around the detected tight bounding box, clamped to source dimensions
+  const padX = Math.round(tightW * 0.05);
+  const padY = Math.round(tightH * 0.05);
+
+  const cropX = Math.max(0, tightLeft - padX);
+  const cropY = Math.max(0, tightTop - padY);
+  const cropRight = Math.min(srcW, tightRight + padX);
+  const cropBottom = Math.min(srcH, tightBottom + padY);
 
   return {
     x: cropX,
@@ -562,16 +576,422 @@ function makePolkaDotPath(
 }
 
 interface CellSubSample {
+  /** Number of sub-pixels passing standard foreground threshold (0..64) */
   fgCount: number;
+  /** Number of sub-pixels passing faint/thin-stroke threshold (0..64) */
+  faintCount: number;
+  /** Minimum luminance (0..255, where 0 is pure black) of the darkest pixel in the cell */
+  minLum: number;
+  /** Peak contrast strength (0..255) of the darkest/strongest sub-pixel in the cell */
+  maxContrast: number;
   r: number;
   g: number;
   b: number;
 }
 
 /**
+ * Checks whether a sub-pixel contains even a faint trace of a thin calligraphy/script stroke
+ * that was partially diluted with the background during canvas downsampling.
+ */
+function isFaintStrokeSubPixel(
+  r: number,
+  g: number,
+  b: number,
+  a: number,
+  ignoreBackground: boolean,
+  threshold: number,
+): boolean {
+  if (a < 20) {
+    return false;
+  }
+  if (!ignoreBackground) {
+    return true;
+  }
+  const faintLimit = Math.min(244, threshold + 18);
+  const lightness = (r * 299 + g * 587 + b * 114) / 1000;
+  const maxDiff = Math.max(Math.abs(r - g), Math.abs(g - b), Math.abs(r - b));
+  if (lightness < faintLimit) {
+    return true;
+  }
+  if (maxDiff > 16 && lightness < 248) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Computes a 0..255 contrast score measuring how strongly a sub-pixel stands out from the background.
+ */
+function computeSubPixelContrast(
+  r: number,
+  g: number,
+  b: number,
+  a: number,
+  ignoreBackground: boolean,
+): number {
+  if (!ignoreBackground) {
+    return a;
+  }
+  const distW = Math.sqrt(
+    ((255 - r) * (255 - r) + (255 - g) * (255 - g) + (255 - b) * (255 - b)) / 3,
+  );
+  const lightness = (r * 299 + g * 587 + b * 114) / 1000;
+  const lumDrop = 255 - lightness;
+  const alphaFactor = a / 255;
+  return Math.min(255, Math.round(Math.max(distW, lumDrop) * alphaFactor));
+}
+
+/**
+ * Applies a linear contrast boost away from white for thin-stroke cells whose sub-pixels
+ * were partially blended with the white background during downsampling, preserving hue
+ * while preventing thin strokes from averaging out to pale gray/white.
+ */
+function boostThinStrokeColor(
+  r: number,
+  g: number,
+  b: number,
+  effectiveCount: number,
+  ignoreBackground: boolean,
+): { r: number; g: number; b: number } {
+  if (!ignoreBackground || effectiveCount >= 28) {
+    return { r, g, b };
+  }
+  const boost =
+    effectiveCount <= 4
+      ? 1.65
+      : effectiveCount <= 10
+        ? 1.42
+        : effectiveCount <= 18
+          ? 1.24
+          : 1.12;
+  const dr = 255 - r;
+  const dg = 255 - g;
+  const db = 255 - b;
+  return {
+    r: Math.max(0, Math.min(255, Math.round(255 - dr * boost))),
+    g: Math.max(0, Math.min(255, Math.round(255 - dg * boost))),
+    b: Math.max(0, Math.min(255, Math.round(255 - db * boost))),
+  };
+}
+
+/**
+ * Ensures continuous line and curve preservation for thin calligraphy/script fonts on lower
+ * grid resolutions (e.g. 20x20, 30x30, 40x40) via local ridge detection, topological curve
+ * hysteresis, and 1-cell micro-gap endpoint bridging.
+ */
+function preserveContinuousStrokeLines(
+  cellMatrix: CellSubSample[][],
+  activeGrid: boolean[][],
+  rows: number,
+  cols: number,
+): void {
+  const getCell = (r: number, c: number): CellSubSample | undefined =>
+    cellMatrix[r]?.[c];
+  const isActive = (r: number, c: number): boolean =>
+    Boolean(activeGrid[r]?.[c]);
+  const setActive = (r: number, c: number, val: boolean): void => {
+    const row = activeGrid[r];
+    if (row && c >= 0 && c < cols) {
+      row[c] = val;
+    }
+  };
+
+  // Helper: maximum strict fgCount among 8-neighbors in the 3x3 window around (r, c)
+  const getMaxNeighborFg = (r: number, c: number): number => {
+    let maxFg = 0;
+    for (let dr = -1; dr <= 1; dr++) {
+      for (let dc = -1; dc <= 1; dc++) {
+        if (dr === 0 && dc === 0) continue;
+        const n = getCell(r + dr, c + dc);
+        if (n && n.fgCount > maxFg) {
+          maxFg = n.fgCount;
+        }
+      }
+    }
+    return maxFg;
+  };
+
+  // Pass 1: Minimum-luminance / dark-pixel & >10-15% percentage stroke weight preservation,
+  // plus 1D ridge spine detection for delicate calligraphy hairlines.
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      if (isActive(r, c)) continue;
+      const cell = getCell(r, c);
+      if (!cell || cell.faintCount === 0) continue;
+
+      const maxNeighborFg = getMaxNeighborFg(r, c);
+      const isThinRegion = maxNeighborFg < 46;
+
+      if (isThinRegion) {
+        // Activate if >10% of pixels are below brightness threshold (fgCount >= 7 of 64),
+        // OR if the darkest pixel in the cell is below the dark-stroke luminance threshold
+        if (
+          cell.fgCount >= 3 ||
+          cell.minLum <= 195 ||
+          (cell.fgCount >= 1 && cell.maxContrast >= 42) ||
+          (cell.faintCount >= 2 && cell.maxContrast >= 24)
+        ) {
+          setActive(r, c, true);
+          continue;
+        }
+      }
+
+      // 1D Ridge Detection across horizontal, vertical, and both diagonal axes:
+      // Preserves delicate script loops even when passing near thicker downstrokes
+      if (cell.faintCount >= 2 && cell.maxContrast >= 26) {
+        const s = cell.faintCount * 2 + cell.maxContrast * 0.25;
+        const scoreAt = (rr: number, cc: number): number => {
+          const n = getCell(rr, cc);
+          return n ? n.faintCount * 2 + n.maxContrast * 0.25 : 0;
+        };
+        const fgAt = (rr: number, cc: number): number =>
+          getCell(rr, cc)?.fgCount ?? 0;
+
+        const isHorizRidge =
+          s >= scoreAt(r, c - 1) &&
+          s >= scoreAt(r, c + 1) &&
+          fgAt(r, c - 1) < 28 &&
+          fgAt(r, c + 1) < 28 &&
+          (s > scoreAt(r, c - 1) || s > scoreAt(r, c + 1));
+        const isVertRidge =
+          s >= scoreAt(r - 1, c) &&
+          s >= scoreAt(r + 1, c) &&
+          fgAt(r - 1, c) < 28 &&
+          fgAt(r + 1, c) < 28 &&
+          (s > scoreAt(r - 1, c) || s > scoreAt(r + 1, c));
+        const isDiag1Ridge =
+          s >= scoreAt(r - 1, c - 1) &&
+          s >= scoreAt(r + 1, c + 1) &&
+          fgAt(r - 1, c - 1) < 28 &&
+          fgAt(r + 1, c + 1) < 28 &&
+          (s > scoreAt(r - 1, c - 1) || s > scoreAt(r + 1, c + 1));
+        const isDiag2Ridge =
+          s >= scoreAt(r - 1, c + 1) &&
+          s >= scoreAt(r + 1, c - 1) &&
+          fgAt(r - 1, c + 1) < 28 &&
+          fgAt(r + 1, c - 1) < 28 &&
+          (s > scoreAt(r - 1, c + 1) || s > scoreAt(r + 1, c - 1));
+
+        if (isHorizRidge || isVertRidge || isDiag1Ridge || isDiag2Ridge) {
+          setActive(r, c, true);
+        }
+      }
+    }
+  }
+
+  // Pass 2: Topological Curve Continuity Hysteresis.
+  // If an inactive cell was grazed by the stroke (faintCount >= 1) and sits between two
+  // active neighbors in its 3x3 window that are not already 4-connected to each other,
+  // activate it so curves never break into disconnected fragments.
+  for (let pass = 0; pass < 2; pass++) {
+    const toActivate: { r: number; c: number }[] = [];
+
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        if (isActive(r, c)) continue;
+        const cell = getCell(r, c);
+        if (!cell || (cell.faintCount === 0 && cell.maxContrast < 16)) continue;
+        if (getMaxNeighborFg(r, c) >= 50) continue;
+
+        const activeNeighbors: { dr: number; dc: number }[] = [];
+        for (let dr = -1; dr <= 1; dr++) {
+          for (let dc = -1; dc <= 1; dc++) {
+            if (dr === 0 && dc === 0) continue;
+            if (isActive(r + dr, c + dc)) {
+              activeNeighbors.push({ dr, dc });
+            }
+          }
+        }
+
+        if (activeNeighbors.length >= 2) {
+          // Check if any pair of active neighbors is not already mutually 4-adjacent
+          let bridgesSeparatedNeighbors = false;
+          for (let i = 0; i < activeNeighbors.length; i++) {
+            for (let j = i + 1; j < activeNeighbors.length; j++) {
+              const n1 = activeNeighbors[i];
+              const n2 = activeNeighbors[j];
+              if (!n1 || !n2) continue;
+              const manhattan =
+                Math.abs(n1.dr - n2.dr) + Math.abs(n1.dc - n2.dc);
+              if (manhattan > 1) {
+                // Check if they already share an active 4-neighbor in the 3x3 box
+                const sharesActiveCorner = activeNeighbors.some(
+                  (n3) =>
+                    Math.abs(n3.dr - n1.dr) + Math.abs(n3.dc - n1.dc) === 1 &&
+                    Math.abs(n3.dr - n2.dr) + Math.abs(n3.dc - n2.dc) === 1,
+                );
+                if (!sharesActiveCorner) {
+                  bridgesSeparatedNeighbors = true;
+                  break;
+                }
+              }
+            }
+            if (bridgesSeparatedNeighbors) break;
+          }
+
+          if (bridgesSeparatedNeighbors) {
+            toActivate.push({ r, c });
+          }
+        }
+      }
+    }
+
+    for (const pt of toActivate) {
+      setActive(pt.r, pt.c, true);
+    }
+    if (toActivate.length === 0) break;
+  }
+
+  // Pass 3: 8-Way Stroke Continuity Check (Orphan Stitches, Closed-Loop Breaks & Diagonal/Knight's-Move Gaps).
+  // Checks if two active thin-stroke cells at Chebyshev distance 2 lack a short local 8-connected
+  // path (length <= 3). Using local path distance instead of only global component IDs ensures
+  // that 1-cell breaks on closed cursive loops (such as the upper loop of a cursive "P") are bridged.
+  const countActive8Neighbors = (r: number, c: number): number => {
+    let cnt = 0;
+    for (let dr = -1; dr <= 1; dr++) {
+      for (let dc = -1; dc <= 1; dc++) {
+        if (dr === 0 && dc === 0) continue;
+        if (isActive(r + dr, c + dc)) cnt++;
+      }
+    }
+    return cnt;
+  };
+
+  const hasShortActive8Path = (
+    r1: number,
+    c1: number,
+    r2: number,
+    c2: number,
+  ): boolean => {
+    if (Math.max(Math.abs(r1 - r2), Math.abs(c1 - c2)) <= 1) {
+      return true;
+    }
+    // Check for path of length 2 (shared active 8-neighbor) or length 3
+    const n1List: { r: number; c: number }[] = [];
+    for (let dr = -1; dr <= 1; dr++) {
+      for (let dc = -1; dc <= 1; dc++) {
+        if (dr === 0 && dc === 0) continue;
+        const nr = r1 + dr;
+        const nc = c1 + dc;
+        if (isActive(nr, nc)) {
+          if (Math.max(Math.abs(nr - r2), Math.abs(nc - c2)) <= 1) {
+            return true; // Path of length 2
+          }
+          n1List.push({ r: nr, c: nc });
+        }
+      }
+    }
+    for (const n1 of n1List) {
+      for (let dr = -1; dr <= 1; dr++) {
+        for (let dc = -1; dc <= 1; dc++) {
+          if (dr === 0 && dc === 0) continue;
+          const nnr = n1.r + dr;
+          const nnc = n1.c + dc;
+          if (
+            isActive(nnr, nnc) &&
+            Math.max(Math.abs(nnr - r2), Math.abs(nnc - c2)) <= 1
+          ) {
+            return true; // Path of length 3
+          }
+        }
+      }
+    }
+    return false;
+  };
+
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      if (!isActive(r, c)) continue;
+      // Focus on orphan stitches (0 neighbors), stroke endpoints (1 neighbor), or thin curve turns (<= 2 neighbors)
+      if (countActive8Neighbors(r, c) > 2) continue;
+      const cellA = getCell(r, c);
+      if (!cellA || cellA.fgCount >= 40) continue;
+
+      // Search at Chebyshev distance 2 (1-cell gap in all 8 directions + knight's moves)
+      for (let dr = -2; dr <= 2; dr++) {
+        for (let dc = -2; dc <= 2; dc++) {
+          if (Math.max(Math.abs(dr), Math.abs(dc)) !== 2) continue;
+          const tr = r + dr;
+          const tc = c + dc;
+          if (tr < 0 || tr >= rows || tc < 0 || tc >= cols) continue;
+          if (!isActive(tr, tc)) continue;
+
+          // Skip if already locally 8-connected within 3 steps
+          if (hasShortActive8Path(r, c, tr, tc)) continue;
+
+          const cellB = getCell(tr, tc);
+          if (!cellB || cellB.fgCount >= 44) continue;
+
+          // Find candidate intermediate cell(s) 8-adjacent to both (r, c) and (tr, tc)
+          let bestMid: { r: number; c: number; score: number } | null = null;
+          for (let mr = Math.min(r, tr); mr <= Math.max(r, tr); mr++) {
+            for (let mc = Math.min(c, tc); mc <= Math.max(c, tc); mc++) {
+              if (
+                Math.max(Math.abs(mr - r), Math.abs(mc - c)) === 1 &&
+                Math.max(Math.abs(mr - tr), Math.abs(mc - tc)) === 1 &&
+                !isActive(mr, mc)
+              ) {
+                const midCell = getCell(mr, mc);
+                const score = midCell
+                  ? midCell.faintCount * 10 +
+                    midCell.maxContrast +
+                    (255 - midCell.minLum)
+                  : 0;
+                if (!bestMid || score > bestMid.score) {
+                  bestMid = { r: mr, c: mc, score };
+                }
+              }
+            }
+          }
+
+          // Bridge the 1-cell gap if the intermediate cell has any faint trace OR if both endpoints are thin strokes with similar color
+          if (bestMid) {
+            const colorDiffSq = colorDistSq(
+              cellA.r,
+              cellA.g,
+              cellA.b,
+              cellB.r,
+              cellB.g,
+              cellB.b,
+            );
+            if (bestMid.score > 0 || colorDiffSq <= 65 * 65) {
+              const midCell = getCell(bestMid.r, bestMid.c);
+              if (midCell) {
+                if (midCell.faintCount === 0) {
+                  midCell.r = Math.round((cellA.r + cellB.r) / 2);
+                  midCell.g = Math.round((cellA.g + cellB.g) / 2);
+                  midCell.b = Math.round((cellA.b + cellB.b) / 2);
+                }
+                setActive(bestMid.r, bestMid.c, true);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Pass 4: Isolated speckle guard — remove single-cell faint noise specks that have 0 active neighbors
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      if (!isActive(r, c)) continue;
+      const cell = getCell(r, c);
+      if (!cell) continue;
+      if (
+        cell.fgCount < 5 &&
+        cell.maxContrast < 75 &&
+        countActive8Neighbors(r, c) === 0
+      ) {
+        setActive(r, c, false);
+      }
+    }
+  }
+}
+
+/**
  * Step 1: Auto-crops foreground bounds, performs 8x8 sub-pixel supersampling per cell
- * (computing cell color exclusively from core foreground sub-pixels so white backgrounds never
- * bleed into gray edge halos), and quantizes into `colorCountLimit` palette colors.
+ * (with thin-stroke contrast boost and continuous curve preservation for delicate script fonts),
+ * and quantizes into `colorCountLimit` palette colors.
  */
 export function quantizeCanvasToPattern(
   sourceCanvas: HTMLCanvasElement,
@@ -666,13 +1086,22 @@ export function quantizeCanvasToPattern(
       }
     }
   } else {
-    // 8x8 Sub-pixel supersampling per grid cell
+    // 8x8 Sub-pixel supersampling per grid cell with thin-stroke contrast boost
     const cellMatrix: CellSubSample[][] = [];
 
     for (let r = 0; r < rows; r++) {
       const rowCells: CellSubSample[] = [];
       for (let c = 0; c < cols; c++) {
-        const fgSubs: { distW: number; r: number; g: number; b: number }[] = [];
+        const fgSubs: { contrast: number; r: number; g: number; b: number }[] =
+          [];
+        const faintSubs: {
+          contrast: number;
+          r: number;
+          g: number;
+          b: number;
+        }[] = [];
+        let maxContrast = 0;
+        let minLum = 255;
 
         for (let sy = 0; sy < ss; sy++) {
           const py = r * ss + sy;
@@ -684,6 +1113,17 @@ export function quantizeCanvasToPattern(
             const blue = data[idx + 2] ?? 0;
             const alpha = data[idx + 3] ?? 0;
 
+            const lum = Math.round(
+              (red * 299 + green * 587 + blue * 114) / 1000,
+            );
+            const contrast = computeSubPixelContrast(
+              red,
+              green,
+              blue,
+              alpha,
+              ignoreBackground,
+            );
+
             if (
               !isBackgroundPixel(
                 red,
@@ -694,59 +1134,112 @@ export function quantizeCanvasToPattern(
                 backgroundThreshold,
               )
             ) {
-              const distW =
-                (255 - red) * (255 - red) +
-                (255 - green) * (255 - green) +
-                (255 - blue) * (255 - blue);
-              fgSubs.push({ distW, r: red, g: green, b: blue });
+              fgSubs.push({ contrast, r: red, g: green, b: blue });
+              faintSubs.push({ contrast, r: red, g: green, b: blue });
+              if (contrast > maxContrast) {
+                maxContrast = contrast;
+              }
+              if (lum < minLum) {
+                minLum = lum;
+              }
+            } else if (
+              isFaintStrokeSubPixel(
+                red,
+                green,
+                blue,
+                alpha,
+                ignoreBackground,
+                backgroundThreshold,
+              )
+            ) {
+              faintSubs.push({ contrast, r: red, g: green, b: blue });
+              if (contrast > maxContrast) {
+                maxContrast = contrast;
+              }
+              if (lum < minLum) {
+                minLum = lum;
+              }
             }
           }
         }
 
-        if (fgSubs.length === 0) {
-          rowCells.push({ fgCount: 0, r: 0, g: 0, b: 0 });
+        const sourceSubs = fgSubs.length > 0 ? fgSubs : faintSubs;
+
+        if (sourceSubs.length === 0) {
+          rowCells.push({
+            fgCount: 0,
+            faintCount: 0,
+            minLum: 255,
+            maxContrast: 0,
+            r: 0,
+            g: 0,
+            b: 0,
+          });
         } else {
-          // Sort foreground sub-pixels by distance from white background so core interior
-          // color dominates and anti-aliased edge sub-pixels never create gray halos
-          fgSubs.sort((a, b) => b.distW - a.distW);
-          const coreCount = Math.max(1, Math.ceil(fgSubs.length * 0.5));
+          // Sort sub-pixels by contrast descending (darkest/strongest stroke pixels first).
+          // For thin strokes (few sub-pixels), sample only the darkest 25% spine pixels
+          // and apply a contrast boost so the cell never averages out to white/light gray.
+          sourceSubs.sort((a, b) => b.contrast - a.contrast);
+          const coreFraction = sourceSubs.length < 20 ? 0.25 : 0.5;
+          const coreCount = Math.max(
+            1,
+            Math.ceil(sourceSubs.length * coreFraction),
+          );
           let sumR = 0;
           let sumG = 0;
           let sumB = 0;
           for (let i = 0; i < coreCount; i++) {
-            const sub = fgSubs[i];
+            const sub = sourceSubs[i];
             if (sub) {
               sumR += sub.r;
               sumG += sub.g;
               sumB += sub.b;
             }
           }
+
+          const rawR = Math.round(sumR / coreCount);
+          const rawG = Math.round(sumG / coreCount);
+          const rawB = Math.round(sumB / coreCount);
+          const boosted = boostThinStrokeColor(
+            rawR,
+            rawG,
+            rawB,
+            fgSubs.length > 0 ? fgSubs.length : faintSubs.length,
+            ignoreBackground,
+          );
+
           rowCells.push({
             fgCount: fgSubs.length,
-            r: Math.round(sumR / coreCount),
-            g: Math.round(sumG / coreCount),
-            b: Math.round(sumB / coreCount),
+            faintCount: faintSubs.length,
+            minLum,
+            maxContrast,
+            r: boosted.r,
+            g: boosted.g,
+            b: boosted.b,
           });
         }
       }
       cellMatrix.push(rowCells);
     }
 
-    // Standard coverage threshold: 18/64 (~28%)
+    // Standard coverage threshold for thick filled shapes: 18/64 (~28%)
     const minSubPixels = 18;
     const activeGrid: boolean[][] = cellMatrix.map((row) =>
       row.map((cell) => cell.fgCount >= minSubPixels),
     );
 
+    // Enhance thin calligraphy/script strokes and enforce continuous curve preservation
+    preserveContinuousStrokeLines(cellMatrix, activeGrid, rows, cols);
+
     // Preserve sharp extreme tips on the top and bottom rows of the tight bounding box
     const topRow = cellMatrix[0];
     const activeTopRow = activeGrid[0];
     if (topRow && activeTopRow && !activeTopRow.some(Boolean)) {
-      const maxFg = Math.max(...topRow.map((cell) => cell.fgCount));
-      if (maxFg >= 6) {
+      const maxFg = Math.max(...topRow.map((cell) => cell.faintCount));
+      if (maxFg >= 2) {
         for (let c = 0; c < cols; c++) {
           const cell = topRow[c];
-          if (cell && cell.fgCount >= maxFg * 0.75) {
+          if (cell && cell.faintCount >= maxFg * 0.75) {
             activeTopRow[c] = true;
           }
         }
@@ -756,11 +1249,11 @@ export function quantizeCanvasToPattern(
     const bottomRow = cellMatrix[rows - 1];
     const activeBottomRow = activeGrid[rows - 1];
     if (bottomRow && activeBottomRow && !activeBottomRow.some(Boolean)) {
-      const maxFg = Math.max(...bottomRow.map((cell) => cell.fgCount));
-      if (maxFg >= 6) {
+      const maxFg = Math.max(...bottomRow.map((cell) => cell.faintCount));
+      if (maxFg >= 2) {
         for (let c = 0; c < cols; c++) {
           const cell = bottomRow[c];
-          if (cell && cell.fgCount >= maxFg * 0.75) {
+          if (cell && cell.faintCount >= maxFg * 0.75) {
             activeBottomRow[c] = true;
           }
         }
