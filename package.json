@@ -8,7 +8,7 @@
     "start": "npx @canva/cli apps start",
     "start:example": "tsx ./scripts/examples.ts",
     "start:preview": "npx @canva/cli apps start --preview",
-    "build": "canva-app-scripts build",
+    "build": "npx @canva/cli apps build",
     "lint:types": "tsc",
     "lint": "eslint .",
     "lint:strict": "eslint . --max-warnings=0",
