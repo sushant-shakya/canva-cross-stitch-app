@@ -4,40 +4,55 @@ import {
   Box,
   Button,
   Checkbox,
+  ColorSelector,
   FileInput,
   FormField,
   ImageCard,
+  NumberInput,
   Rows,
   SegmentedControl,
   Select,
+  Swatch,
   Text,
   TextInput,
   Title,
 } from "@canva/app-ui-kit";
 import type { ImageRef } from "@canva/asset";
 import { upload } from "@canva/asset";
-import {
-  addElementAtCursor,
-  addElementAtPoint,
-  addNativeElement,
-} from "@canva/design";
+import type { ImageElement } from "@canva/design";
+import { addElementAtCursor, addElementAtPoint } from "@canva/design";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { FormattedMessage, useIntl } from "react-intl";
 import * as styles from "styles/components.css";
 import type {
   GridSize,
-  PatternResult,
+  PaletteColorEntry,
+  QuantizedPatternBase,
   StitchStyle,
 } from "./utils/pattern_generator";
 import {
-  generatePatternFromCanvas,
+  buildPatternResultFromQuantized,
+  getContrastTextColor,
   imageToCanvas,
   loadImageFromFile,
+  normalizeHexColor,
+  quantizeCanvasToPattern,
   renderTextToCanvas,
 } from "./utils/pattern_generator";
 import { PRESETS } from "./utils/presets";
 
 type InputSource = "upload" | "text" | "presets";
+
+const QUICK_THREAD_COLORS = [
+  "#000000",
+  "#FFFFFF",
+  "#E63946",
+  "#FF2E63",
+  "#FFB703",
+  "#2A9D8F",
+  "#1D3557",
+  "#7D2AE8",
+];
 
 export const App = () => {
   const intl = useIntl();
@@ -47,12 +62,13 @@ export const App = () => {
   const addElement = [addElementAtPoint, addElementAtCursor].find((fn) =>
     isSupported(fn),
   );
-  const canAdd = isSupported(addNativeElement) || !!addElement;
+  const canAdd = Boolean(addElement);
 
-  // Form State
+  // Configuration State
   const [inputSource, setInputSource] = useState<InputSource>("upload");
   const [gridSize, setGridSize] = useState<GridSize>(40);
   const [stitchStyle, setStitchStyle] = useState<StitchStyle>("cross_stitch");
+  const [colorCountLimit, setColorCountLimit] = useState<number>(8);
   const [ignoreBackground, setIgnoreBackground] = useState<boolean>(true);
 
   // Source image / text state
@@ -63,15 +79,45 @@ export const App = () => {
   const [uploadedPreviewUrl, setUploadedPreviewUrl] = useState<string>("");
   const [customText, setCustomText] = useState<string>("CANVA");
 
-  // Output pattern state
-  const [patternResult, setPatternResult] = useState<PatternResult | null>(
-    null,
+  // Quantized Pattern Base & Interactive Palette State
+  const [quantizedBase, setQuantizedBase] =
+    useState<QuantizedPatternBase | null>(null);
+  const [paletteEntries, setPaletteEntries] = useState<PaletteColorEntry[]>([]);
+  const [selectedColorIndex, setSelectedColorIndex] = useState<number | null>(
+    0,
   );
+  const [hexInputText, setHexInputText] = useState<string>("");
+
+  // UI Status State
   const [previewObjectUrl, setPreviewObjectUrl] = useState<string>("");
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
   const [isAdding, setIsAdding] = useState<boolean>(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  // Live reactive pattern computation whenever palette, stitchStyle, or quantizedBase changes
+  const patternResult = useMemo(() => {
+    if (!quantizedBase) {
+      return null;
+    }
+    return buildPatternResultFromQuantized(
+      quantizedBase,
+      paletteEntries,
+      stitchStyle,
+    );
+  }, [quantizedBase, paletteEntries, stitchStyle]);
+
+  // Sync hexInputText when selectedColorIndex or paletteEntries changes
+  const selectedPaletteItem =
+    selectedColorIndex != null
+      ? (paletteEntries[selectedColorIndex] ?? null)
+      : null;
+
+  useEffect(() => {
+    if (selectedPaletteItem) {
+      setHexInputText(selectedPaletteItem.currentHex);
+    }
+  }, [selectedPaletteItem]);
 
   // Initialize with heart preset so users see immediate value
   useEffect(() => {
@@ -80,17 +126,15 @@ export const App = () => {
       const cvs = defaultPreset.createCanvas();
       setActiveCanvas(cvs);
       try {
-        const initial = generatePatternFromCanvas(cvs, {
+        const initialBase = quantizeCanvasToPattern(cvs, {
           gridSize: 40,
           stitchStyle: "cross_stitch",
           ignoreBackground: true,
+          colorCountLimit: 8,
         });
-        setPatternResult(initial);
-        const blob = new Blob([initial.svgString], {
-          type: "image/svg+xml;charset=utf-8",
-        });
-        const url = URL.createObjectURL(blob);
-        setPreviewObjectUrl(url);
+        setQuantizedBase(initialBase);
+        setPaletteEntries(initialBase.initialPalette);
+        setSelectedColorIndex(initialBase.initialPalette.length > 0 ? 0 : null);
       } catch {
         // Fallback gracefully if canvas context is not ready
       }
@@ -184,16 +228,23 @@ export const App = () => {
     setErrorMessage(null);
     setStatusMessage(null);
 
-    // Offscreen async generation to keep UI responsive
     setTimeout(() => {
       try {
         if (!source) return;
-        const result = generatePatternFromCanvas(source, {
+        const nextBase = quantizeCanvasToPattern(source, {
           gridSize,
           stitchStyle,
           ignoreBackground,
+          colorCountLimit,
         });
-        setPatternResult(result);
+        const built = buildPatternResultFromQuantized(
+          nextBase,
+          nextBase.initialPalette,
+          stitchStyle,
+        );
+        setQuantizedBase(nextBase);
+        setPaletteEntries(nextBase.initialPalette);
+        setSelectedColorIndex(nextBase.initialPalette.length > 0 ? 0 : null);
         setStatusMessage(
           intl.formatMessage(
             {
@@ -203,8 +254,8 @@ export const App = () => {
                 "Status message indicating successful pattern generation",
             },
             {
-              stitches: result.stitchCount,
-              colors: result.colorCount,
+              stitches: built.stitchCount,
+              colors: built.colorCount,
             },
           ),
         );
@@ -221,6 +272,7 @@ export const App = () => {
     }, 20);
   }, [
     activeCanvas,
+    colorCountLimit,
     customText,
     gridSize,
     ignoreBackground,
@@ -228,6 +280,66 @@ export const App = () => {
     intl,
     stitchStyle,
   ]);
+
+  // Interactive Palette Actions
+  const handleSelectSwatch = (index: number) => {
+    setSelectedColorIndex(index);
+    const entry = paletteEntries[index];
+    if (entry) {
+      setHexInputText(entry.currentHex);
+    }
+  };
+
+  const handleUpdateSelectedColor = useCallback(
+    (newColorInput: string) => {
+      if (selectedColorIndex == null) return;
+      const normalized = normalizeHexColor(newColorInput);
+      if (!normalized) return;
+
+      setPaletteEntries((prev) =>
+        prev.map((entry, idx) =>
+          idx === selectedColorIndex
+            ? { ...entry, currentHex: normalized, removed: false }
+            : entry,
+        ),
+      );
+    },
+    [selectedColorIndex],
+  );
+
+  const handleHexInputChange = (value: string) => {
+    setHexInputText(value);
+    const normalized = normalizeHexColor(value);
+    if (normalized) {
+      handleUpdateSelectedColor(normalized);
+    }
+  };
+
+  const handleToggleRemoveColor = useCallback((index: number) => {
+    setPaletteEntries((prev) =>
+      prev.map((entry, idx) =>
+        idx === index ? { ...entry, removed: !entry.removed } : entry,
+      ),
+    );
+  }, []);
+
+  const handleRestoreAllColors = useCallback(() => {
+    setPaletteEntries((prev) =>
+      prev.map((entry) => ({
+        ...entry,
+        removed: false,
+        currentHex: entry.originalHex,
+      })),
+    );
+  }, []);
+
+  const hasRemovedOrEditedColors = useMemo(
+    () =>
+      paletteEntries.some(
+        (entry) => entry.removed || entry.currentHex !== entry.originalHex,
+      ),
+    [paletteEntries],
+  );
 
   // Insert onto active Canva canvas
   const handleAddPatternToCanva = useCallback(async () => {
@@ -255,9 +367,9 @@ export const App = () => {
         // Fallback gracefully in testing / offline / mock mode
       }
 
-      const elementData = assetRef
+      const elementData: ImageElement = assetRef
         ? {
-            type: "image" as const,
+            type: "image",
             ref: assetRef,
             altText: {
               text: `Cross-stitch vector pattern (${stitchStyle}, ${gridSize}x${gridSize})`,
@@ -265,7 +377,7 @@ export const App = () => {
             },
           }
         : {
-            type: "image" as const,
+            type: "image",
             dataUrl,
             altText: {
               text: `Cross-stitch vector pattern (${stitchStyle}, ${gridSize}x${gridSize})`,
@@ -273,16 +385,9 @@ export const App = () => {
             },
           };
 
-      // Insert onto design canvas via addNativeElement or addElement fallback
-      try {
-        await addNativeElement(elementData);
-      } catch {
-        if (addElement) {
-          await addElement(elementData);
-        } else {
-          throw new Error("Unable to insert element onto Canva canvas.");
-        }
-      }
+      // Insert onto design canvas via addElementAtPoint (or addElementAtCursor)
+      const insertElement = addElement ?? addElementAtPoint;
+      await insertElement(elementData);
 
       setStatusMessage(
         intl.formatMessage({
@@ -609,6 +714,43 @@ export const App = () => {
           )}
         />
 
+        {/* Color Count selector (2 to 16 colors) */}
+        <FormField
+          label={intl.formatMessage({
+            defaultMessage: "Color Count",
+            description: "Color quantization count input label",
+          })}
+          description={intl.formatMessage({
+            defaultMessage:
+              "Quantize pattern into 2 to 16 dominant thread colors",
+            description: "Color count selector description",
+          })}
+          control={(props) => (
+            <NumberInput
+              {...props}
+              min={2}
+              max={16}
+              step={1}
+              value={colorCountLimit}
+              hasSpinButtons
+              decrementAriaLabel={intl.formatMessage({
+                defaultMessage: "Decrease color count",
+                description: "Aria label for decrementing color count",
+              })}
+              incrementAriaLabel={intl.formatMessage({
+                defaultMessage: "Increase color count",
+                description: "Aria label for incrementing color count",
+              })}
+              onChange={(val) => {
+                if (typeof val === "number" && !Number.isNaN(val)) {
+                  const clamped = Math.max(2, Math.min(16, Math.round(val)));
+                  setColorCountLimit(clamped);
+                }
+              }}
+            />
+          )}
+        />
+
         {/* Background Filter */}
         <FormField
           label={intl.formatMessage({
@@ -671,8 +813,8 @@ export const App = () => {
           </Alert>
         )}
 
-        {/* Pattern Preview Section */}
-        {patternResult && previewObjectUrl && (
+        {/* Pattern Preview & Interactive Thread Palette Section */}
+        {patternResult && (previewObjectUrl || patternResult.dataUrl) && (
           <Rows spacing="1.5u">
             <Title size="small">
               <FormattedMessage
@@ -684,7 +826,7 @@ export const App = () => {
             {/* Needlework canvas checkered container with ImageCard */}
             <div className={styles.previewBox}>
               <ImageCard
-                thumbnailUrl={previewObjectUrl}
+                thumbnailUrl={previewObjectUrl || patternResult.dataUrl}
                 alt={intl.formatMessage({
                   defaultMessage: "Generated vector cross-stitch pattern",
                   description: "Alt text for generated vector preview",
@@ -732,26 +874,186 @@ export const App = () => {
               </div>
             </div>
 
-            {/* Thread Palette swatches */}
-            {patternResult.palette.length > 0 && (
-              <Box>
-                <Text size="xsmall" tone="tertiary">
-                  <FormattedMessage
-                    defaultMessage="Thread Palette:"
-                    description="Thread colors list label"
-                  />
-                </Text>
-                <div className={styles.paletteContainer}>
-                  {patternResult.palette.slice(0, 16).map((hex) => (
-                    <div
-                      key={hex}
-                      className={styles.paletteChip}
-                      style={{ backgroundColor: hex }}
-                      title={hex}
+            {/* Interactive Numbered Thread Palette Bar */}
+            {paletteEntries.length > 0 && (
+              <Rows spacing="1u">
+                <div className={styles.paletteHeaderRow}>
+                  <Text size="xsmall" tone="tertiary">
+                    <FormattedMessage
+                      defaultMessage="Palette (click a number to edit or remove):"
+                      description="Interactive numbered thread palette header"
                     />
-                  ))}
+                  </Text>
+                  {hasRemovedOrEditedColors && (
+                    <Button
+                      variant="secondary"
+                      size="small"
+                      onClick={handleRestoreAllColors}
+                    >
+                      {intl.formatMessage({
+                        defaultMessage: "Restore All Colors",
+                        description:
+                          "Button to restore all removed or modified palette colors",
+                      })}
+                    </Button>
+                  )}
                 </div>
-              </Box>
+
+                <div className={styles.paletteContainer}>
+                  {paletteEntries.map((entry, idx) => {
+                    const isSelected = selectedColorIndex === idx;
+                    const textColor = getContrastTextColor(entry.currentHex);
+                    const boxClasses = [
+                      styles.paletteSwatchBox,
+                      isSelected ? styles.paletteSwatchActive : "",
+                      entry.removed ? styles.paletteSwatchRemoved : "",
+                    ]
+                      .filter(Boolean)
+                      .join(" ");
+                    const swatchAriaLabel = intl.formatMessage(
+                      {
+                        defaultMessage: "Palette color {number} ({hex})",
+                        description:
+                          "Accessible label for numbered palette swatch button",
+                      },
+                      {
+                        number: idx + 1,
+                        hex: entry.currentHex,
+                      },
+                    );
+                    const swatchDisplayLabel = entry.removed
+                      ? intl.formatMessage({
+                          defaultMessage: "X",
+                          description: "Removed color marker on palette swatch",
+                        })
+                      : String(idx + 1);
+
+                    return (
+                      <div
+                        key={entry.index}
+                        role="button"
+                        tabIndex={0}
+                        aria-label={swatchAriaLabel}
+                        className={boxClasses}
+                        style={{
+                          backgroundColor: entry.currentHex,
+                          color: textColor,
+                        }}
+                        title={swatchAriaLabel}
+                        onClick={() => handleSelectSwatch(idx)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            handleSelectSwatch(idx);
+                          }
+                        }}
+                      >
+                        {swatchDisplayLabel}
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Edit Color Section for Selected Palette Swatch */}
+                {selectedPaletteItem && selectedColorIndex != null && (
+                  <div className={styles.editColorPanel}>
+                    <Rows spacing="1.5u">
+                      <div className={styles.editColorHeader}>
+                        <Text size="small">
+                          <FormattedMessage
+                            defaultMessage="Edit Color #{number} ({hex})"
+                            description="Title of the Edit Color panel for the selected palette swatch"
+                            values={{
+                              number: selectedColorIndex + 1,
+                              hex: selectedPaletteItem.currentHex,
+                            }}
+                          />
+                        </Text>
+                        <Text size="xsmall" tone="tertiary">
+                          <FormattedMessage
+                            defaultMessage="{count} stitches"
+                            description="Number of stitches belonging to the selected palette color"
+                            values={{ count: selectedPaletteItem.stitchCount }}
+                          />
+                        </Text>
+                      </div>
+
+                      <div className={styles.colorPickerRow}>
+                        <ColorSelector
+                          color={selectedPaletteItem.currentHex}
+                          onChange={(newColor) => {
+                            setHexInputText(newColor.toUpperCase());
+                            handleUpdateSelectedColor(newColor);
+                          }}
+                        />
+                        <div className={styles.hexInputWrapper}>
+                          <TextInput
+                            value={hexInputText}
+                            onChange={handleHexInputChange}
+                            placeholder={intl.formatMessage({
+                              defaultMessage: "#000000",
+                              description: "Hex color code input placeholder",
+                            })}
+                          />
+                        </div>
+                      </div>
+
+                      <div className={styles.quickSwatchRow}>
+                        {QUICK_THREAD_COLORS.map((presetHex) => (
+                          <Swatch
+                            key={presetHex}
+                            fill={[presetHex]}
+                            active={
+                              selectedPaletteItem.currentHex.toUpperCase() ===
+                              presetHex
+                            }
+                            tooltipLabel={presetHex}
+                            onClick={() => {
+                              setHexInputText(presetHex);
+                              handleUpdateSelectedColor(presetHex);
+                            }}
+                          />
+                        ))}
+                      </div>
+
+                      <div className={styles.actionButtonRow}>
+                        <Button
+                          variant="secondary"
+                          size="small"
+                          onClick={() =>
+                            handleToggleRemoveColor(selectedColorIndex)
+                          }
+                        >
+                          {selectedPaletteItem.removed
+                            ? intl.formatMessage({
+                                defaultMessage: "Restore Color",
+                                description:
+                                  "Button to restore a removed palette color",
+                              })
+                            : intl.formatMessage({
+                                defaultMessage: "Remove Color",
+                                description:
+                                  "Button to remove the selected palette color from the pattern",
+                              })}
+                        </Button>
+                        {hasRemovedOrEditedColors && (
+                          <Button
+                            variant="secondary"
+                            size="small"
+                            onClick={handleRestoreAllColors}
+                          >
+                            {intl.formatMessage({
+                              defaultMessage: "Restore All Colors",
+                              description:
+                                "Button in edit panel to restore all palette colors",
+                            })}
+                          </Button>
+                        )}
+                      </div>
+                    </Rows>
+                  </div>
+                )}
+              </Rows>
             )}
 
             {/* Add Pattern to Canva Button */}
@@ -759,7 +1061,7 @@ export const App = () => {
               variant="primary"
               stretch
               loading={isAdding}
-              disabled={!canAdd || isAdding}
+              disabled={!canAdd || isAdding || patternResult.stitchCount === 0}
               onClick={handleAddPatternToCanva}
             >
               {intl.formatMessage({

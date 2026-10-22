@@ -1,9 +1,5 @@
 import { useFeatureSupport } from "@canva/app-hooks";
-import {
-  addElementAtCursor,
-  addElementAtPoint,
-  addNativeElement,
-} from "@canva/design";
+import { addElementAtCursor, addElementAtPoint } from "@canva/design";
 import type { Feature } from "@canva/platform";
 import { act, fireEvent, waitFor } from "@testing-library/react";
 import { renderInTestProvider } from "../../../utils/test_render";
@@ -11,7 +7,6 @@ import { App } from "../app";
 
 jest.mock("@canva/app-hooks");
 jest.mock("@canva/design", () => ({
-  addNativeElement: jest.fn(),
   addElementAtPoint: jest.fn(),
   addElementAtCursor: jest.fn(),
 }));
@@ -42,19 +37,19 @@ describe("Cross-Stitch & Pixel Pattern App Tests", () => {
         255,
         46,
         99,
-        255, // stitch pixel 1
+        255, // stitch pixel 1 (pink-red)
         255,
         46,
         99,
-        255, // stitch pixel 2
+        255, // stitch pixel 2 (pink-red)
+        30,
+        30,
+        36,
+        255, // stitch pixel 3 (dark gray)
         255,
         255,
         255,
         255, // white background (ignored)
-        0,
-        0,
-        0,
-        0, // transparent background (ignored)
       ]),
       width: 2,
       height: 2,
@@ -90,20 +85,18 @@ describe("Cross-Stitch & Pixel Pattern App Tests", () => {
       .mockReturnValue("data:image/png;base64,mockpngdata");
 
     mockIsSupported.mockImplementation(
-      (fn: Feature) =>
-        fn === addNativeElement ||
-        fn === addElementAtPoint ||
-        fn === addElementAtCursor,
+      (fn: Feature) => fn === addElementAtPoint || fn === addElementAtCursor,
     );
     mockUseFeatureSupport.mockReturnValue(mockIsSupported);
   });
 
-  it("should render UI controls including Grid Size and Stitch Style selectors", () => {
+  it("should render UI controls including Grid Size, Stitch Style, and Color Count selectors", () => {
     const result = renderInTestProvider(<App />);
 
     expect(result.getByText("Cross-Stitch & Pixel Pattern")).toBeDefined();
     expect(result.getByText("Grid Size")).toBeDefined();
     expect(result.getByText("Stitch Style")).toBeDefined();
+    expect(result.getByText("Color Count")).toBeDefined();
     expect(result.getByText("Background Filter")).toBeDefined();
 
     const generateBtn = result.getByRole("button", {
@@ -112,25 +105,43 @@ describe("Cross-Stitch & Pixel Pattern App Tests", () => {
     expect(generateBtn).toBeDefined();
   });
 
-  it("should generate a pattern and allow adding it to Canva", async () => {
+  it("should generate a pattern, support interactive palette editing/removal, and add to Canva", async () => {
     const result = renderInTestProvider(<App />);
 
-    // Click Generate Pattern
     const generateBtn = result.getByRole("button", {
       name: "Generate Pattern",
     });
 
     await act(async () => {
       fireEvent.click(generateBtn);
-      // Wait for internal generation setTimeout
       await new Promise((r) => setTimeout(r, 60));
     });
 
-    // Check that Add Pattern to Canva button appears
     await waitFor(() => {
       expect(
         result.getByRole("button", { name: "Add Pattern to Canva" }),
       ).toBeDefined();
+    });
+
+    // Verify numbered palette swatches and Edit Color section
+    const removeColorBtn = result.getByRole("button", {
+      name: "Remove Color",
+    });
+    expect(removeColorBtn).toBeDefined();
+
+    // Remove the selected color and verify Restore Color / Restore All Colors appear
+    await act(async () => {
+      fireEvent.click(removeColorBtn);
+    });
+
+    expect(result.getByRole("button", { name: "Restore Color" })).toBeDefined();
+    expect(
+      result.getAllByRole("button", { name: "Restore All Colors" }).length,
+    ).toBeGreaterThan(0);
+
+    // Restore color
+    await act(async () => {
+      fireEvent.click(result.getByRole("button", { name: "Restore Color" }));
     });
 
     const addBtn = result.getByRole("button", {
@@ -142,14 +153,13 @@ describe("Cross-Stitch & Pixel Pattern App Tests", () => {
     });
 
     await waitFor(() => {
-      expect(addNativeElement).toBeDefined();
+      expect(addElementAtPoint).toHaveBeenCalled();
     });
   });
 
   it("should switch between input tabs: Upload, Presets, and Text Logo", async () => {
     const result = renderInTestProvider(<App />);
 
-    // Click Presets tab
     const presetsTab = result.getByRole("radio", { name: "Presets" });
     await act(async () => {
       fireEvent.click(presetsTab);
@@ -158,7 +168,6 @@ describe("Cross-Stitch & Pixel Pattern App Tests", () => {
     expect(result.getByText("Select a sample design to stitch:")).toBeDefined();
     expect(result.getByRole("button", { name: "Star" })).toBeDefined();
 
-    // Click Text Logo tab
     const textTab = result.getByRole("radio", { name: "Text Logo" });
     await act(async () => {
       fireEvent.click(textTab);

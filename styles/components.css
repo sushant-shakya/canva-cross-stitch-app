@@ -87,22 +87,94 @@
   gap: 6px;
 }
 
-/* Thread palette chips */
+/* Interactive numbered palette bar */
+.paletteHeaderRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
 .paletteContainer {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
   align-items: center;
-  margin-top: 4px;
+  margin-top: 6px;
 }
 
-.paletteChip {
-  width: 20px;
-  height: 20px;
-  border-radius: 50%;
-  border: 2px solid #ffffff;
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.2);
-  flex-shrink: 0;
+.paletteSwatchBox {
+  position: relative;
+  width: 34px;
+  height: 34px;
+  border-radius: 6px;
+  border: 2px solid rgba(0, 0, 0, 0.16);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  user-select: none;
+  box-sizing: border-box;
+  transition:
+    transform 0.1s ease,
+    box-shadow 0.1s ease;
+}
+
+.paletteSwatchBox:hover {
+  transform: translateY(-1px);
+}
+
+.paletteSwatchActive {
+  border-color: #ffffff;
+  box-shadow:
+    0 0 0 2px #7d2ae8,
+    0 2px 6px rgba(125, 42, 232, 0.35);
+}
+
+.paletteSwatchRemoved {
+  opacity: 0.48;
+  border-style: dashed;
+}
+
+/* Edit Color Panel */
+.editColorPanel {
+  background: #f8f9fb;
+  border: 1px solid #dfe2e7;
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.editColorHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.colorPickerRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.hexInputWrapper {
+  flex: 1;
+  min-width: 0;
+}
+
+.quickSwatchRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.actionButtonRow {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 /* Upload thumbnail box */
@@ -134,30 +206,4 @@
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   gap: 6px;
-}
-
-/* File upload drop area */
-.fileInputArea {
-  position: relative;
-  border: 2px dashed #cfd3d8;
-  border-radius: 8px;
-  padding: 16px;
-  text-align: center;
-  background-color: #fafbfc;
-  cursor: pointer;
-  transition: border-color 0.15s ease;
-}
-
-.fileInputArea:hover {
-  border-color: #7d2ae8;
-}
-
-.hiddenFileInput {
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
-  opacity: 0;
-  cursor: pointer;
 }
